@@ -1,0 +1,210 @@
+name: Performance Start Stop
+run-name: "${{ inputs.choice }} Performance"
+on:
+  workflow_dispatch:
+    inputs:
+      choice:
+        type: choice
+        description: Select Action
+        options:
+        - Start
+        - Stop
+
+jobs:
+  automate:
+    runs-on: self-hosted
+    permissions:
+      id-token: write
+      contents: write    
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+          token: ${{ secrets.PAT_GITHUB }}
+
+    - name: Fetch Userlist
+      id: readUsernames
+      run: |
+        cd ${{ github.workspace }}/performance/
+        echo "::set-output name=usernames::$(cat desired-username.txt | tr '\n' ' ')"
+
+    - name: Check if this github user is added in the list
+      run: |
+        desired_usernames=(${{ steps.readUsernames.outputs.usernames }})
+
+        found=false
+        for username in "${desired_usernames[@]}"; do
+          if [ "${{ github.actor }}" == "$username" ]; then
+            found=true
+            break
+          fi
+        done
+
+        if $found; then
+          echo "The username found in the list."
+        else
+          echo "The username is not in the list. Stopping workflow."
+          exit 1
+        fi
+
+    - name: Authenticate with AWS
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{secrets.RDS_START_STOP_ROLE_ARN}}
+        role-skip-session-tagging: true
+        aws-region: us-west-2
+        disable-retry: true
+
+    - name: Install AWS CLI
+      uses: unfor19/install-aws-cli-action@v1
+      with:
+        arch: arm64
+
+    - name: ${{ inputs.choice }} RDS Start Instance 
+      run: |
+        choice=${{ inputs.choice }}
+        rds_identifier=fareye-performance
+        
+        # Check the current status of the RDS instance
+        status=$(aws rds describe-db-instances --db-instance-identifier $rds_identifier --query 'DBInstances[0].DBInstanceStatus' --output text)
+        echo "$rds_identifier instance is currently in $status state"
+        
+        if [ "$choice" == "Start" ] && [ "$status" == "stopped" ] ; then
+          aws rds start-db-instance --db-instance-identifier $rds_identifier
+          for ((i=5; i<1; i--)); do
+            echo "checking DB Instance status"
+            status=$(aws rds describe-db-instances --db-instance-identifier $rds_identifier --query 'DBInstances[0].DBInstanceStatus' --output text)
+            echo "$rds_identifier instance is currently in $status state"
+            sleep $((i * 60))
+            if [ "$status" == "available" ]; then
+              echo "RDS instance $rds_identifier is now available"
+              break  # Exit the loop if the instance is available
+            else
+              echo "Instance status: $status"
+            fi
+          done
+        fi
+
+    - name: Set up SSH
+      uses: webfactory/ssh-agent@v0.5.3
+      with:
+        ssh-private-key: ${{ secrets.VM_PRIVATE_KEY }}
+
+    - name: Starting Debezium Connector on VM
+      run: |
+        choice=${{ inputs.choice }}
+        if [ "$choice" == "Start" ]; then
+          ssh -o StrictHostKeyChecking=no ubuntu@10.100.71.174 "sudo docker start connect-performance"
+          sleep 120
+          ssh -o StrictHostKeyChecking=no ubuntu@10.100.71.174 "sudo bash /home/ubuntu/debezium-performance/curl_put_performance.sh"  
+        else
+          ssh -o StrictHostKeyChecking=no ubuntu@10.100.71.174 "sudo docker ps -a | grep connect-performance"
+        fi
+
+    - name: Uncomment in kustomization and updating git
+      run: |
+        choice=${{ inputs.choice }}
+        cd ${{ github.workspace }}/performance/
+        if [ "$choice" == "Start" ]; then
+          if grep -q "#" "kustomization.yaml"; then
+            echo "found #"
+            sed -i 's/^#//g' kustomization.yaml # Uncomment lines
+            cat kustomization.yaml
+            git config --local user.email "devops.admin+github@fareye.com"
+            git config --local user.name "FarEye DevOps"
+            git status
+            git diff
+            git add .
+            git commit -m "$choice Performance Environment"
+            git push origin ${{ github.ref }}
+          else
+            echo "File is already uncommented"
+          fi
+        fi     
+
+    - name: Comment in kustomization and updating git
+      run: |
+        choice=${{ inputs.choice }}
+        cd ${{ github.workspace }}/performance/
+        if [ "$choice" == "Stop" ]; then
+          if grep -q "#" "kustomization.yaml"; then
+            echo "file is already commented"
+            cat kustomization.yaml
+          else
+            echo "Found #"
+            sed -i 's/^/#/g' kustomization.yaml # comment lines  
+            cat kustomization.yaml
+            git config --local user.email "devops.admin+github@fareye.com"
+            git config --local user.name "FarEye DevOps"
+            git status
+            git diff
+            git add .
+            git commit -m "$choice Performance Environment"
+            git push origin ${{ github.ref }}                   
+          fi
+          sleep 200
+        fi  
+
+    - name: Set up SSH
+      uses: webfactory/ssh-agent@v0.5.3
+      with:
+        ssh-private-key: ${{ secrets.VM_PRIVATE_KEY }}
+
+    - name: Stopping Debezium Connector on VM
+      run: |
+        choice=${{ inputs.choice }}
+        if [ "$choice" == "Stop" ]; then
+          ssh -o StrictHostKeyChecking=no ubuntu@10.100.71.174 "sudo docker stop connect-performance"  
+        else
+          ssh -o StrictHostKeyChecking=no ubuntu@10.100.71.174 "sudo docker ps -a | grep connect-performance"
+        fi
+
+    - name: Set up PostgreSQL client
+      run: |
+        choice=${{ inputs.choice }}
+        if [ "$choice" == "Stop" ]; then
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client -y
+        fi
+
+    - name: Truncate Tables and Drop Slot
+      run: |
+        db_host=fareye-performance.cr36kj0cz8eo.us-west-2.rds.amazonaws.com
+        db_username=qa_truncate_user
+        db_name=fareye_mobi
+        choice=${{ inputs.choice }}
+        if [ "$choice" == "Stop" ]; then
+          # List of tables to truncate
+          file_path="${{ github.workspace }}/.github/workflows/tables_name.txt"
+          PGPASSWORD=${{ secrets.PERFORMANCE_DB_CREDENTIAL }} psql -U $db_username -h $db_host -d $db_name -c "select slot_name from pg_replication_slots where slot_name='debperformancek8s';" | grep debperformancek8s
+          if [ $? -ne 0 ]; then
+            echo "slot is not there in DB"
+          else
+            echo "Deleting slot from DB"
+            PGPASSWORD=${{ secrets.PERFORMANCE_DB_CREDENTIAL }} psql -U $db_username -h $db_host -d $db_name -c "select pg_drop_replication_slot('debperformancek8s');"
+          fi
+          if [ -e "$file_path" ]; then
+            # Loop through each line in the file and print the table name
+            while IFS= read -r table; do
+              echo "Truncating $table"
+              PGPASSWORD=${{ secrets.PERFORMANCE_DB_CREDENTIAL }} psql -U $db_username -h $db_host -d $db_name -c "truncate $table;"
+            done < "$file_path"
+          else
+              echo "Table names file not found."
+          fi
+        fi
+        
+    - name: ${{ inputs.choice }} RDS Stop Instance 
+      run: |
+        choice=${{ inputs.choice }}
+        rds_identifier=fareye-performance
+        
+        # Check the current status of the RDS instance
+        status=$(aws rds describe-db-instances --db-instance-identifier $rds_identifier --query 'DBInstances[0].DBInstanceStatus' --output text)
+        echo "$rds_identifier instance is currently in $status state"
+        
+        if [ "$choice" == "Stop" ] && [ "$status" == "available" ]; then
+          aws rds stop-db-instance --db-instance-identifier $rds_identifier
+          echo "RDS DB Instance stopping in process"
+        fi
